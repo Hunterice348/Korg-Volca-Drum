@@ -1,0 +1,173 @@
+name: V-DRUM LAB CI
+
+on:
+  push:
+    branches: [ main, develop ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  JUCE_TAG: "8.0.8"          # закрепите версию JUCE, которую используете локально
+  PLUGIN_NAME: "V-DRUM LAB"
+
+jobs:
+  # ============================================================
+  #  Сборка на Windows: матрица дисков C: и D: (требование ТЗ)
+  # ============================================================
+  build-windows:
+    name: Build Windows x64 (${{ matrix.config }}, drive ${{ matrix.drive }})
+    runs-on: windows-2022
+    strategy:
+      fail-fast: false
+      matrix:
+        config: [ Release ]
+        drive: [ C, D ]
+
+    defaults:
+      run:
+        shell: pwsh
+        working-directory: ${{ matrix.drive }}:\V-DRUM-LAB
+
+    steps:
+      # ---------- 1. Исходники ----------
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      # Переносим проект на нужный диск (C: или D:).
+      # На hosted-runner Windows диск D: присутствует (temporary disk).
+      - name: Relocate sources to drive ${{ matrix.drive }}:
+        shell: pwsh
+        working-directory: ${{ github.workspace }}
+        run: |
+          $dst = "${{ matrix.drive }}:\V-DRUM-LAB"
+          if ("${{ github.workspace }}" -ne $dst) {
+            robocopy "${{ github.workspace }}" $dst /E /NFL /NDL /NJH /NJS /NP
+            if ($LASTEXITCODE -ge 8) { exit 1 } else { $global:LASTEXITCODE = 0 }
+          }
+          Write-Host "Sources ready at $dst"
+
+      # ---------- 2. JUCE (submodule или клон по тегу) ----------
+      - name: Cache JUCE
+        id: cache-juce
+        uses: actions/cache@v4
+        with:
+          path: ${{ matrix.drive }}:\V-DRUM-LAB\JUCE
+          key: juce-${{ env.JUCE_TAG }}-${{ runner.os }}
+
+      - name: Fetch JUCE if missing
+        run: |
+          if (-not (Test-Path "JUCE/CMakeLists.txt")) {
+            git clone --depth 1 --branch $env:JUCE_TAG `
+              https://github.com/juce-framework/JUCE.git JUCE
+          } else {
+            Write-Host "JUCE already present (submodule or cache)."
+          }
+
+      # ---------- 3. Конфигурация CMake ----------
+      # ВАЖНО: COPY_PLUGIN_AFTER_BUILD отключён в CI (нет прав на Program Files).
+      - name: Configure (CMake)
+        run: |
+          cmake -S . -B build -G "Visual Studio 17 2022" -A x64 `
+            -DCMAKE_BUILD_TYPE=${{ matrix.config }} `
+            -DVDRUM_COPY_PLUGIN_AFTER_BUILD=OFF
+
+      # ---------- 4. Сборка ----------
+      - name: Build
+        run: cmake --build build --config ${{ matrix.config }} --parallel
+
+      # ---------- 5. Тесты (если подключены в CMake) ----------
+      - name: Run tests (CTest)
+        run: |
+          if (Test-Path "build/CTestTestfile.cmake") {
+            ctest --test-dir build -C ${{ matrix.config }} --output-on-failure
+          } else {
+            Write-Host "Tests not configured yet - skipping (этапы 2-10)."
+          }
+
+      # ---------- 6. Проверка артефактов ----------
+      - name: Verify build artefacts
+        run: |
+          $art = "build/VDrumLab_artefacts/${{ matrix.config }}"
+          $vst3 = Get-ChildItem -Path "$art/VST3" -Recurse -Filter "*.vst3" |
+                  Select-Object -First 1
+          if (-not $vst3) { throw "VST3 not found!" }
+          Write-Host "VST3: $($vst3.FullName)"
+          $exe = Get-ChildItem -Path "$art/Standalone" -Filter "*.exe" -ErrorAction SilentlyContinue
+          if ($exe) { Write-Host "Standalone: $($exe.FullName)" }
+          "VST3_PATH=$($vst3.FullName)" >> $env:GITHUB_ENV
+
+      # ---------- 7. Валидация pluginval ----------
+      - name: Validate with pluginval
+        continue-on-error: true   # на headless-runner аудио может быть недоступно
+        run: |
+          Invoke-WebRequest `
+            -Uri "https://github.com/Tracktion/pluginval/releases/latest/download/pluginval_Windows.zip" `
+            -OutFile pluginval.zip
+          Expand-Archive pluginval.zip -DestinationPath pluginval
+          & pluginval/pluginval.exe --strictness-level 5 --validate-in-process `
+            --verbose --validate "$env:VST3_PATH"
+
+      # ---------- 8. Упаковка и загрузка артефактов ----------
+      - name: Package artefacts
+        if: matrix.drive == 'C'   # загружаем один комплект, не дублируем C/D
+        run: |
+          $art = "build/VDrumLab_artefacts/${{ matrix.config }}"
+          Compress-Archive -Path "$art/VST3" -DestinationPath "V-DRUM-LAB-VST3-Win64.zip"
+          if (Test-Path "$art/Standalone") {
+            Compress-Archive -Path "$art/Standalone" -DestinationPath "V-DRUM-LAB-Standalone-Win64.zip"
+          }
+
+      - name: Upload VST3 artefact
+        if: matrix.drive == 'C'
+        uses: actions/upload-artifact@v4
+        with:
+          name: V-DRUM-LAB-VST3-Win64
+          path: ${{ matrix.drive }}:\V-DRUM-LAB\V-DRUM-LAB-VST3-Win64.zip
+          retention-days: 30
+
+      - name: Upload Standalone artefact
+        if: matrix.drive == 'C' && hashFiles(format('{0}:\V-DRUM-LAB\V-DRUM-LAB-Standalone-Win64.zip', matrix.drive)) != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: V-DRUM-LAB-Standalone-Win64
+          path: ${{ matrix.drive }}:\V-DRUM-LAB\V-DRUM-LAB-Standalone-Win64.zip
+          retention-days: 30
+
+  # ============================================================
+  #  Release по тегу v* (например, v1.0.0)
+  # ============================================================
+  release:
+    name: Create GitHub Release
+    needs: build-windows
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download artefacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.zip
+          generate_release_notes: true
+          body: |
+            ## V-DRUM LAB ${{ github.ref_name }}
+
+            **Установка VST3:** распакуйте `V-DRUM-LAB-VST3-Win64.zip` и
+            скопируйте папку `V-DRUM LAB.vst3` в
+            `C:\Program Files\Common Files\VST3\`
+            (или в любую пользовательскую папку VST3, в т.ч. на диске D:).
